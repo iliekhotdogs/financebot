@@ -9,19 +9,19 @@ journal/cache/
 journal/cycle.lock
 reports/
 
-# Credential backups and local runtime data
+# GitHub snapshot: secrets and generated runtime data
 .env*
 *.pem
 *.key
 .pytest_cache/
-journal/
+reports/
 daily_reviews/
 scratch/
 articles/
 experiments/
+journal/*
+!journal/*.py
+!journal/.gitkeep
 learning/*.csv
 learning/*.json
 learning/*.jsonl
-!journal/
-journal/*
-!journal/.gitkeep

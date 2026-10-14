@@ -1,0 +1,27 @@
+# Secrets — never commit to version control
+.env
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime state / caches
+journal/cache/
+journal/cycle.lock
+reports/
+
+# Credential backups and local runtime data
+.env*
+*.pem
+*.key
+.pytest_cache/
+journal/
+daily_reviews/
+scratch/
+articles/
+experiments/
+learning/*.csv
+learning/*.json
+learning/*.jsonl
+!journal/
+journal/*
+!journal/.gitkeep

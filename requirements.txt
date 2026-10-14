@@ -1,0 +1,12 @@
+alpaca-py>=0.44
+yfinance>=1.7
+pandas>=2.0
+numpy>=1.26
+pyyaml>=6.0
+python-dotenv>=1.0
+tabulate>=0.9
+openai>=1.40        # advisor (Kimi via NVIDIA, OpenAI-compatible) — was missing:
+                    # audit log showed "openai package not installed"
+flask>=3.0          # live dashboard
+matplotlib>=3.8     # equity chart image for the Discord daily summary
+pytest>=8.0

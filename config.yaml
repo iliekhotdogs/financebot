@@ -1,0 +1,394 @@
+# Combined Trading Bot — Alpaca + yfinance (paper) / Liquid Trade (live phase 2)
+# Mode: PAPER — Alpaca + yfinance only until paper trading is validated.
+# Liquid integration is configured but DISABLED. See liquid.enabled.
+
+market_universe:
+  # "static" = the curated list below (recommended).
+  # "dynamic" = Alpaca assets → common-stock filter → liquidity screen →
+  #             top max_symbols by dollar volume (cached daily).
+  # Never run the full ~13.5k-symbol universe: each candidate symbol costs
+  # research + model calls and a 5-min cycle cannot cover it (OOM / 2.7h cycles).
+  mode: "static"
+  symbols:
+    - AAPL
+    - MSFT
+    - NVDA
+    - AMZN
+    - GOOGL
+    - META
+    - AVGO
+    - TSLA
+    - JPM
+    - V
+    - MA
+    - UNH
+    - LLY
+    - XOM
+    - HD
+    - COST
+    - PG
+    - JNJ
+    - ABBV
+    - MRK
+    - KO
+    - PEP
+    - WMT
+    - BAC
+    - NFLX
+    - AMD
+    - CRM
+    - ORCL
+    - ADBE
+    - CSCO
+    - QCOM
+    - TXN
+  dynamic:
+    asset_class: "us_equity"
+    exchanges: ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"]
+    min_price: 5.0                 # applied via batched Alpaca snapshots
+    min_dollar_volume: 20000000    # prev-session close x volume
+    max_symbols: 50                # ranked by dollar volume, NOT alphabetical
+    hard_cap: 200                  # max_symbols is clamped to this (0 = hard_cap)
+    exclude:
+      - VIX
+
+data:
+  # Calendar days of daily bars per cycle. Must cover sma_long + ATR warm-up
+  # (60 days ≈ 41 bars < SMA50, which made every signal 0).
+  lookback_days: 150
+
+execution:
+  # Scheduled `python main.py cycle` places PAPER orders only when true.
+  # Orders still require Jev confidence + RiskManager approval. Live
+  # (non-paper) execution is refused in code regardless of this flag.
+  auto_trade: true
+  require_market_open: true      # no queued market orders pre-market
+
+alpaca:
+  paper: true
+  base_url: "https://paper-api.alpaca.markets"
+  data_url: "https://paper-api.alpaca.markets"
+
+yfinance:
+  default_period: "1y"
+  default_interval: "1d"
+  backfill_on_missing: true
+
+liquid:
+  enabled: false               # Phase 2 — only after paper trading validated
+  market: "stock-perps"        # NVDA/AAPL/TSLA stock-linked perps
+  url: "https://coinvest-computer.liquid.trade/mcp"
+  paper: true                  # Always paper until operator approves live
+
+# ──────────────────────────────────────────────────────────────
+# Advisor model — provides advice only, NO order placement.
+# Credentials via environment variable (see config/sample.env).
+# ──────────────────────────────────────────────────────────────
+advisor:
+  enabled: true
+  provider: "openai"            # openai | anthropic | mock
+  model: "moonshotai/kimi-k3"  # Kimi K3 via NVIDIA API
+  timeout_seconds: 90
+  api_key_env: "NVIDIA_API_KEY"  # env var name; key never logged
+  base_url: "https://integrate.api.nvidia.com/v1"  # NVIDIA direct API
+  interval_minutes: 15          # advisor window opens at most once per 15 min
+  max_calls_per_cycle: 3        # ...and then covers at most 3 actionable symbols.
+                                # Only entry candidates / held positions are ever
+                                # sent; no-signal symbols never reach the models.
+
+# ──────────────────────────────────────────────────────────────
+# Jev model — sole final decision-maker.
+# Receives snapshot + valid actions + advisor output.
+# Does NOT place orders or access exchange credentials.
+# ──────────────────────────────────────────────────────────────
+jev:
+  enabled: true
+  provider: "typesafe"          # openai | anthropic | typesafe | mock
+  model: "jev-latest"           # TypeSafe AI model name
+  timeout_seconds: 30
+  api_key_env: "JEV_API_KEY"    # env var name; key never logged
+  min_confidence_entry: 0.60    # Jev buy below this confidence → hold
+  min_confidence_exit: 0.60     # discretionary Jev sell below this → hold
+                                # (rule-based v1.1 exits always execute)
+  review_open_positions: true   # ask Jev about held positions (once per day, see below)
+  decide_once_per_day: true
+  shadow_max_calls: 3           # etf_trend mode: Jev reviews new entries AFTER they are placed;
+                                # its view is logged and scored, it never blocks an order     # one Jev verdict per symbol per day (entry and
+                                # held review). Jev is stochastic; re-asking every
+                                # 5 min made the confidence gate "retry until yes".
+
+strategy:
+  # Which bot runs on the schedule:
+  #   etf_trend      — 9 asset-class ETFs, 10-month trend rule, monthly (see etf_trend below)
+  #   stock_signals  — the original SMA 20/50 stock bot with the Jev gate (legacy;
+  #                    switch back here to roll back, nothing else to change)
+  mode: "etf_trend"
+  # (stock_signals settings below) Label only — the running version is taken from the strategy code
+  # (strategies/v1_1.py). learning/active_strategy.json (written by
+  # `learning-approve`) overrides these parameters.
+  version: "v1.1"
+  type: "sma_cross_v1_1"
+  sma_short: 20
+  sma_long: 50
+  atr_period: 14
+  atr_mult_initial: 3.0
+  entry_lookback_bars: 3        # fresh crossover within N bars = entry signal
+
+# ──────────────────────────────────────────────────────────────
+# ETF trend strategy (strategy.mode = etf_trend) — strategies/etf_trend.py.
+# Evidence: scripts/etf_trend_backtest.py (1997-2026 and 2007-2026, next-day
+# fills, costs). Parameters are FIXED: re-tuning them yearly did worse.
+# ──────────────────────────────────────────────────────────────
+etf_trend:
+  symbols: [SPY, IWM, EFA, EEM, IEF, TLT, GLD, DBC, VNQ]  # US, small caps, intl, EM, 7-10y & 20y Treasuries, gold, commodities, REITs
+  cash_symbol: BIL              # out-of-market slots earn T-bills
+  lookback_months: 10           # hold while price > 10-month average...
+  band: 0.01                    # ...with a ±1% buffer (buy > avg x 1.01, sell < avg x 0.99)
+  weighting: invvol             # inverse 63-day volatility (smaller drawdowns than equal weight)
+  vol_window: 63
+  max_weight: 0.35              # no single ETF above 35% of the account
+  tranche_days: [0, 5, 10, 15]  # 4 tranches rebalance on trading days 1, 6, 11, 16 of the month
+  min_trade_pct: 0.5            # skip trades smaller than 0.5% of equity (except full exits)
+  cash_buffer_pct: 1.0          # keep 1% in cash for price moves between plan and fill
+  max_drawdown_halt_pct: 40.0   # sells only + Discord alert (and borrowing is paid down). Deeper than the
+                                # overlay's worst test drop (-35%). Set back to 20 if the overlay is turned off.
+  # Option B (strategies/overlay.py; tests: audit/h4_netted.py, audit/h5_ladder.py):
+  # final = leverage x (index_weight x SPY + (1 - index_weight) x trend targets).
+  # The trend book's T-bill (BIL) slot is used before borrowing anything.
+  # 2007-2026 at 40% / 1.5x, borrowing at T-bill + 2.5%: ~10%/yr, Sharpe ~0.60,
+  # worst drop ~-34% (trend alone 4.9%, 0.55, -13%; SPY 11.1%, 0.56, -55%).
+  # Turn off: enabled: false (the bot then behaves exactly as before).
+  overlay:
+    enabled: true
+    index_symbol: SPY
+    index_weight: 0.40          # 40% index fund, 60% trend book
+    leverage: 1.5               # 1.0 = no borrowing; hard limit 2.0
+    max_gross: 1.6              # total long exposure never above 160% of equity
+    borrow_rate_pct: 7.0        # margin rate used by the model/replay — set to Alpaca's current rate
+    require_margin: true        # without a margin account the bot caps exposure at 100% and alerts
+  # AI portfolio manager (ai_pm.py): once per trading day Kimi K3 may tilt the rule targets above.
+  # Code enforces every limit; any failure keeps the plan in place (after stale_days: pure rules).
+  # Big moves need your ✅/❌ on Discord (needs DISCORD_BOT_TOKEN). The rules alone are still
+  # tracked as the "model" in the daily monitor, so you can see whether the AI adds anything.
+  # Turn off: enabled: false (the bot is then exactly the rule strategy again).
+  ai:
+    enabled: true
+    model: "moonshotai/kimi-k3"   # NVIDIA API, same key as the advisor (NVIDIA_API_KEY)
+    decide_after: "06:00"         # Pacific; first trading cycle after this asks the model (data = last close)
+    max_tilt: 0.15                # per ETF, ±15% of equity
+    max_total_tilt: 0.40          # sum of |tilts| ≤ 40% of equity
+    min_change: 0.02              # a plan change of 2%+ in any ETF trades the same day (otherwise on rule days)
+    ask_turnover: 0.25            # ask yes/no before moving more than 25% of the account...
+    ask_exposure_increase: 0.10   # ...or raising total exposure by more than 10 points
+    approval_deadline: "12:00"    # Pacific; no answer by then = skip (keep the current plan)
+    approver_user_id: "721098580697546794"          # your Discord user id; only this user's reaction counts
+    cooldown_days: 3              # after a ❌, big moves are not asked about for 3 trading days
+    stale_days: 5                 # without a good answer for 5 trading days, back to the pure rules
+    news_headlines: 5             # market headlines from Finnhub in the briefing (0 = off)
+
+risk_limits:
+  # Used by strategy.mode = stock_signals only.
+  # Effective limit = min(pct of CURRENT equity, usd cap) — scales down after
+  # losses. Raised 2026-10-04: up to 6 concurrent positions of 5%.
+  per_trade_max_loss_pct: 1.0          # risk per trade (entry - stop) x qty
+  per_trade_max_loss_usd: 1000.0
+  total_open_exposure_pct: 30.0
+  total_open_exposure_usd: 30000.0
+  max_position_size_pct: 5.0
+  max_position_size_usd: 5000.0
+  max_leverage: 1.0            # No leverage until investigated in simulation
+  daily_loss_limit_pct: 3.0
+  daily_loss_limit_usd: 3000.0
+  drawdown_halt_pct: 15.0
+  drawdown_halt_usd: 15000.0
+  min_order_collateral_usd: 15.0
+
+leverage_policy: |
+  Stock bot (stock_signals): max 1x. ETF mode: up to etf_trend.overlay.leverage
+  (1.5x, capped at max_gross 1.6, hard limit 2.0), tested in simulation in
+  audit/h2-h5 before being enabled. Paper account only.
+
+sizing_rule: |
+  Position size = min(intended_notional, max_exposure_remaining).
+  Per-trade risk = position_size * stop_distance.
+  Never size to recover a loss.
+
+shutdown_policy: |
+  When a halt is triggered:
+  1. Assess each open position individually.
+  2. Close positions that can be closed immediately at acceptable cost.
+  3. For positions that cannot be closed immediately, document the
+     reason and management plan.
+  4. Alert operator with full position state.
+
+schedule:
+  # Enforced inside scripts/run_scheduled.py on Pacific wall-clock time, so
+  # it is DST-proof regardless of how Hermes interprets cron timezones.
+  monitoring: "weekdays 05:45-13:00 America/Los_Angeles"
+  review: "13:30 America/Los_Angeles"
+  learning: "13:45 America/Los_Angeles"
+  timezone: "America/Los_Angeles"
+
+journal:
+  log_file: "journal/trade_log.csv"
+  log_no_signal: false          # true = one audit row per no-signal symbol per cycle
+
+paper_trading:
+  platform: "Alpaca"
+  mode: "paper"
+  base_balance_usd: 100000.0
+  data_backfill: "yfinance"
+  data_realtime: "alpaca-iex"
+  cost_modeling:
+    - "Alpaca trading fees (varies by plan)"
+    - "Estimated spreads and slippage"
+    - "No leverage (max_leverage=1.0)"
+
+# ──────────────────────────────────────────────────────────────
+# Discord notifications (notify.py). Transport: DISCORD_WEBHOOK_URL, or the
+# Hermes gateway's DISCORD_BOT_TOKEN + discord_channel_id (both read from
+# /opt/data/.env). Strategy switches are only scheduled after the
+# announcement is confirmed delivered.
+# ──────────────────────────────────────────────────────────────
+notifications:
+  enabled: true
+  discord_channel_id: "1556450440374263949"   # trading bot announcements
+  trades: true          # each paper BUY / SELL
+  promotions: true      # strategy switch announced / applied / vetoed
+  alerts: true          # trading halts, real-money readiness reached
+  daily: true           # end-of-day summary
+  ai: true              # the AI's daily plan, questions and answers
+
+dashboard:
+  enabled: true   # reports/dashboard.html after every cycle (synced to Google Drive)
+
+live_readiness:
+  # etf_trend mode: the 20-year backtest is the strategy evidence; paper has to
+  # show the bot implements it faithfully. See learning/readiness.assess_etf.
+  etf_trend:
+    min_days: 252                 # 12 months on this strategy
+    max_tracking_error_pct: 3.0   # paper vs model daily returns, annualised
+    max_drawdown_pct: 40.0        # overlay on (was 20 without it)
+    drawdown_vs_60_40: false      # overlay on: compare with SPY instead (was true without it)
+    drawdown_vs_spy: true         # paper drawdown no deeper than SPY over the same days
+    min_days_since_switch: 252
+    # with etf_trend.ai on, the tracking-error check is replaced by "ai_beats_rules":
+    # the paper account (with AI) must have returned at least as much as the rules alone.
+  # stock_signals mode: when ALL hold on the actual paper account, Discord gets a "review for
+  # real money" alert. The bot never switches to a live account itself.
+  min_days: 126                 # ~6 months of trading days
+  min_closed_trades: 40
+  min_sharpe: 1.0
+  max_drawdown_pct: 10.0
+  min_psr: 0.95
+  must_beat_benchmark: true     # Sharpe above SPY over the same days
+  min_days_since_switch: 63     # current strategy stable ≥ 3 months
+
+# ──────────────────────────────────────────────────────────────
+# Research roles — specialist analysis feeding Jev.
+# Roles advise Jev; they do NOT place orders or override decisions.
+# ──────────────────────────────────────────────────────────────
+research:
+  enabled: true
+  roles:
+    - "technical"
+    - "fundamental"
+    - "news_sentiment"
+    - "bull_bear"
+  # News sentiment provider — set provider and api_key_env to enable
+  # Supported: "newsapi" (newsapi.org), "finnhub" (finnhub.io), "alpha_vantage"
+  news_provider: "finnhub"
+  news_api_key_env: "FINNHUB_API_KEY"  # set this in .env
+  news_lookback_days: 7       # how many days of news to analyze
+  news_max_headlines: 20      # max headlines per symbol
+
+# ──────────────────────────────────────────────────────────────
+# Recursive learning and strategy selection.
+# Learning runs OUTSIDE the order execution path.
+# Candidates never modify the active strategy directly.
+# Promotion requires explicit operator approval.
+# ──────────────────────────────────────────────────────────────
+learning:
+  # etf_trend mode: the daily `learn` step MONITORS (paper vs model vs SPY and
+  # 60/40, readiness, Jev shadow scoring) — no strategy search. The settings
+  # below are used by stock_signals mode only.
+  enabled: true
+  propose_per_run: 3          # new candidates per `learn` run (daily)
+  explore_per_run: 1          # ...of which drawn from a DIFFERENT strategy family
+  max_live_candidates: 12     # cap on proposed+evaluating+paper candidates
+  gates:
+    min_offline_trades: 20            # over the 3y scored window, whole portfolio
+    min_sharpe_margin_vs_active: 0.10 # must beat the active strategy offline by this
+    psr_min_paper: 0.75               # P[true Sharpe > 0] to enter shadow paper
+    dsr_min_paper: 0.50               # deflated Sharpe (multiple-testing) to enter paper
+    dsr_min_promotion: 0.80           # deflated Sharpe on offline+forward to promote
+  decision_policy:
+    enabled: true
+    min_samples: 30           # matured signals before Jev's threshold/veto is re-fit
+  forecasts:
+    horizon_days: 10          # each executed entry is recorded as a forecast
+    reward_risk: 1.5          # expected return = 1.5 x stop distance
+  # Evaluation settings
+  evaluation:
+    periods:
+      - "training"
+      - "validation"
+      - "out_of_sample"
+    # The search selects on validation+OOS ("scored", 3y); the true holdout
+    # is the forward shadow-paper period. Longer scored windows = more
+    # statistical power and less overfitting than the old 6m/3m windows.
+    # calendar days of daily bars loaded for learning. Must cover
+    # train+validation+OOS (1008 bars) + 60 ≈ 1550 calendar days, plus warm-up.
+    # 1500 silently fell back to a ~412-day scored window (2026-10-05 run).
+    history_days: 1900
+    train_days: 252          # ~1 year (reported, not used for selection)
+    validation_days: 378     # ~1.5 years
+    out_of_sample_days: 378  # ~1.5 years
+    # trades per calendar day per symbol. 0.5 rejected every daily trend
+    # candidate (v1.1 does ~0.005-0.011/day); 0.004 ≈ 1 trade / 250 days.
+    min_trade_frequency: 0.004
+    max_symbols: 20           # symbols used for learning (first N of universe)
+    # Cost model
+    commission_per_share: 0.005
+    min_commission: 1.0
+    slippage_pct: 0.001
+    spread_pct: 0.0005
+  # Promotion gates
+  promotion:
+    min_paper_days: 30
+    min_paper_trades: 10
+    min_paper_symbols: 2
+    min_paper_sharpe: 0.5
+    max_paper_drawdown_pct: 10.0
+    min_paper_net_return_pct: 0.0
+    must_beat_active_on_sharpe: true
+    must_beat_active_on_net_return: false
+    require_operator_approval: true
+    allow_auto_promotion: false  # candidates require explicit operator approval
+    announce_grace_hours: 12     # used only if auto-promotion is re-enabled
+    max_paper_days: 120          # shadow-paper candidates retire after this
+  # Model selection
+  selection:
+    primary_metric: "sharpe_ratio"
+    max_drawdown_pct: 15.0
+    max_exposure_pct: 100.0
+    min_trades: 10
+    min_net_return_pct: 0.0
+    min_periods_passed: 2
+    require_consistency: true
+    max_return_volatility_across_periods: 50.0
+    evaluation_windows:
+      - "validation"
+      - "out_of_sample"
+  # Baselines (always included in every evaluation)
+  baselines:
+    - "sma_cross_20_50"
+    - "buy_and_hold"
+  # Parameter bounds for candidates
+  bounds:
+    min_sma_short: 5
+    max_sma_short: 50
+    min_sma_long: 20
+    max_sma_long: 200
+    max_atr_mult: 5.0
+    min_atr_mult: 0.5
